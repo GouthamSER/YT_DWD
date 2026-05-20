@@ -13,6 +13,13 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiohttp import web
 
+# Import admin and config modules
+try:
+    import config
+    from admin_handlers import setup_admin_handlers
+except ImportError as e:
+    print(f"Warning: Could not import admin modules: {e}")
+
 # ╔══════════════════════════════════════╗
 # ║             CONFIG                   ║
 # ╚══════════════════════════════════════╝
@@ -913,6 +920,12 @@ async def health_check(request):
 async def main():
     await app.start()
     logger.info("✅ Bot running with Pyrofork (Namespace: pyrogram)...")
+    
+    # Initialize MongoDB
+    await config.init_mongodb()
+    
+    # Setup admin handlers
+    await setup_admin_handlers(app)
 
     web_app = web.Application()
     web_app.router.add_get("/", health_check)
@@ -927,6 +940,9 @@ async def main():
 
     await idle()
     await app.stop()
+    
+    # Close MongoDB connection
+    await config.close_mongodb()
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
