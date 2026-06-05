@@ -2,6 +2,7 @@
 ╔══════════════════════════════════════════════════╗
 ║   Advanced YouTube Downloader Bot — Pyrofork     ║
 ║   Playlist • WZML-X Quality • Progress           ║
+║   + Admin Cookies Manager (MongoDB)              ║
 ╚══════════════════════════════════════════════════╝
 """
 
@@ -13,12 +14,15 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiohttp import web
 
-# Import admin and config modules
-try:
-    import config
-    from admin_handlers import setup_admin_handlers
-except ImportError as e:
-    print(f"Warning: Could not import admin modules: {e}")
+# Import config + cookies handler
+import config
+from cookies_handler import (
+    setup_cookies_handlers,
+    auto_import_local_cookies,
+    get_cookies_path,
+    ADMINS,
+    is_admin,
+)
 
 # ╔══════════════════════════════════════╗
 # ║             CONFIG                   ║
@@ -27,35 +31,30 @@ API_ID    = int(os.environ.get("API_ID", ""))
 API_HASH  = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-PROXY_URL     = None  # Render/Koyeb have direct internet access, no proxy needed
+PROXY_URL     = None
 AUTH_USERS    = []
 MAX_PLAYLIST  = 50
 SESSION_TTL   = 600
 PORT          = int(os.environ.get("PORT", 8000))
 
-# ── Render keep-alive ──────────────────────────────────────────────────────────
-# Set RENDER_EXTERNAL_URL in Render dashboard → Environment, e.g.
-#   https://your-service-name.onrender.com
-# The bot will ping itself every 10 minutes so Render doesn't spin it down.
 SELF_PING_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
-PING_INTERVAL = 10 * 60  # seconds (10 min — Render sleeps after ~15 min idle)
-# ──────────────────────────────────────────────────────────────────────────────
+PING_INTERVAL = 10 * 60
 
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-COOKIES_FILE = None
-for _p in [os.path.join(BASE_DIR, "cookies.txt"), os.path.expanduser("~/cookies.txt")]:
-    if os.path.exists(_p):
-        COOKIES_FILE = _p
-        break
+# NOTE: COOKIES_FILE is now dynamic — resolved per-download via get_cookies_path()
+# The module-level constant below is kept only for the /ping status display.
+def _local_cookies_exist():
+    p = os.path.join(BASE_DIR, "cookies.txt")
+    return os.path.exists(p) and os.path.getsize(p) > 0
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger("YTBot")
-logger.info(f"Cookies   : {COOKIES_FILE or 'NOT FOUND'}")
 logger.info(f"Proxy     : {'SET' if PROXY_URL else 'NONE'}")
 logger.info(f"Self-ping : {SELF_PING_URL or 'DISABLED (set RENDER_EXTERNAL_URL)'}")
+logger.info(f"Admins    : {ADMINS or '(none set)'}")
 
 app = Client("yt_bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -128,13 +127,10 @@ async def _safe_edit(msg, text):
 #    RENDER KEEP-ALIVE
 # ═══════════════════════════════════════════
 async def keep_alive():
-    """Pings the bot's own health-check endpoint every PING_INTERVAL seconds.
-    Prevents Render free-tier from spinning the service down due to inactivity.
-    Enable by setting the RENDER_EXTERNAL_URL environment variable."""
     if not SELF_PING_URL:
         logger.info("keep_alive: RENDER_EXTERNAL_URL not set — self-ping disabled.")
         return
-    await asyncio.sleep(30)  # wait for server to be fully up first
+    await asyncio.sleep(30)
     while True:
         try:
             r = requests.get(SELF_PING_URL, timeout=15)
@@ -146,13 +142,13 @@ async def keep_alive():
 # ═══════════════════════════════════════════
 #    PROGRESS TRACKER  (6-second refresh)
 # ═══════════════════════════════════════════
-PROGRESS_INTERVAL = 6  # seconds between Telegram message edits
+PROGRESS_INTERVAL = 6
 
 class YtDlpProgress:
     def __init__(self, msg, loop, title="", prefix="", is_pl=False):
         self.msg    = msg
         self.loop   = loop
-        self.title  = title   # ← video title shown in progress
+        self.title  = title
         self.prefix = prefix
         self.is_pl  = is_pl
         self._dl    = 0
@@ -164,7 +160,7 @@ class YtDlpProgress:
 
     def hook(self, d):
         now = time.time()
-        if now - self._t < PROGRESS_INTERVAL: return   # ← 6-second gate
+        if now - self._t < PROGRESS_INTERVAL: return
         self._t = now
         if d["status"] == "finished":
             if self.is_pl: self._last = 0
@@ -184,7 +180,6 @@ class YtDlpProgress:
         except ZeroDivisionError:
             pct = 0
         bar  = pbar(pct)
-        # Title line — only shown when a title is available
         title_line = f"🎬 `{self.title[:55]}`\n" if self.title else ""
         text = (
             f"{self.prefix}{title_line}"
@@ -198,7 +193,6 @@ class YtDlpProgress:
 
 async def progress_for_upload(current, total, msg, start_time, label="Uploading", title=""):
     now = time.time(); diff = now - start_time
-    # 6-second refresh gate; always fire on completion
     if current != total and (diff < 1 or round(diff) % PROGRESS_INTERVAL != 0):
         return
     pct   = current * 100 / total if total else 0
@@ -216,8 +210,14 @@ async def progress_for_upload(current, total, msg, start_time, label="Uploading"
 
 # ═══════════════════════════════════════════
 #    yt-dlp OPTIONS
+#    ── cookies_path resolved async via get_cookies_path()
 # ═══════════════════════════════════════════
-def _base_opts():
+def _base_opts(cookies_path: str | None = None):
+    """
+    Build base yt-dlp options.
+    `cookies_path` should come from `await get_cookies_path()` so it reflects
+    the latest cookies stored in MongoDB.
+    """
     o = {
         "usenetrc": True,
         "allow_multiple_video_streams": True,
@@ -240,12 +240,15 @@ def _base_opts():
         "extractor_args": {"youtube": {"player_client": ["web","tv"], "skip": ["dash"]}},
         "remote_components": ["ejs:github"],
     }
-    if COOKIES_FILE: o["cookiefile"] = COOKIES_FILE
-    if PROXY_URL:    o["proxy"]      = PROXY_URL
+    # ── cookies: use the path passed in (freshly resolved from DB) ──────────
+    if cookies_path:
+        o["cookiefile"] = cookies_path
+    if PROXY_URL:
+        o["proxy"] = PROXY_URL
     return o
 
-def _info_opts():
-    o = _base_opts()
+def _info_opts(cookies_path: str | None = None):
+    o = _base_opts(cookies_path)
     o.update({
         "quiet": True,
         "no_warnings": True,
@@ -254,8 +257,8 @@ def _info_opts():
     })
     return o
 
-def _dl_opts(fmt, out_tmpl, tracker=None, is_pl=False):
-    o = _base_opts()
+def _dl_opts(fmt, out_tmpl, tracker=None, is_pl=False, cookies_path: str | None = None):
+    o = _base_opts(cookies_path)
     o["outtmpl"] = {"default": out_tmpl, "thumbnail": out_tmpl.replace(".%(ext)s","_t.%(ext)s")}
     o["postprocessors"] = [{"add_chapters":True,"add_infojson":"if_exists","add_metadata":True,"key":"FFmpegMetadata"}]
     if tracker: o["progress_hooks"] = [tracker.hook]
@@ -389,11 +392,11 @@ def _kb_playlist(uid, total):
     ])
 
 # ═══════════════════════════════════════════
-#    INFO EXTRACTION
+#    INFO EXTRACTION  (cookies resolved from DB each call)
 # ═══════════════════════════════════════════
-def _blocking_info(url):
+def _blocking_info(url, cookies_path=None):
     try:
-        with yt_dlp.YoutubeDL(_info_opts()) as ydl:
+        with yt_dlp.YoutubeDL(_info_opts(cookies_path)) as ydl:
             r = ydl.extract_info(url, download=False)
             if r is None: raise ValueError("Info result is None")
             return r
@@ -401,8 +404,8 @@ def _blocking_info(url):
         logger.error(f"Info: {e}")
         return None
 
-def _blocking_playlist_info(url):
-    opts = _info_opts()
+def _blocking_playlist_info(url, cookies_path=None):
+    opts = _info_opts(cookies_path)
     opts.pop("playlist_items", None)
     opts.pop("format", None)
     opts.update({
@@ -426,10 +429,10 @@ def _find_thumb(dl_dir):
             return os.path.join(dl_dir, f)
     return None
 
-def _blocking_download(url, fmt, out_tmpl, smsg, loop, title="", is_pl=False):
+def _blocking_download(url, fmt, out_tmpl, smsg, loop, title="", is_pl=False, cookies_path=None):
     try:
         tracker = YtDlpProgress(smsg, loop, title=title, is_pl=is_pl)
-        opts    = _dl_opts(fmt, out_tmpl, tracker, is_pl)
+        opts    = _dl_opts(fmt, out_tmpl, tracker, is_pl, cookies_path=cookies_path)
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if not info: return None
@@ -481,7 +484,7 @@ async def upload_file(client, chat_id, result, fmt, smsg):
     fp    = result["filepath"]
     info  = result["info"]
     dur   = result["duration"]
-    title = result.get("title","")          # ← carry title through to upload bar
+    title = result.get("title","")
     upl   = info.get("uploader","") or info.get("channel","")
     sz    = os.path.getsize(fp)
 
@@ -519,13 +522,14 @@ async def upload_file(client, chat_id, result, fmt, smsg):
 #    QUALITY PICKER SHOW
 # ═══════════════════════════════════════════
 async def show_quality_picker(url, smsg, user_id=None):
-    loop = asyncio.get_event_loop()
-    info = await loop.run_in_executor(None, _blocking_info, url)
+    loop         = asyncio.get_event_loop()
+    cookies_path = await get_cookies_path()          # ← fresh from DB each time
+    info = await loop.run_in_executor(None, _blocking_info, url, cookies_path)
     if not info:
         await _safe_edit(smsg,
             "❌ **Could not fetch video info!**\n\n"
             "• Is the video private or age-restricted?\n"
-            "• Try refreshing cookies.txt\n"
+            "• Try updating cookies: `/setcookies`\n"
             "• Is the URL correct?")
         return
 
@@ -570,6 +574,7 @@ async def show_quality_picker(url, smsg, user_id=None):
 # ═══════════════════════════════════════════
 @app.on_message(filters.command("start"))
 async def start_cmd(client, message):
+    admin_hint = "\n\n**Admin Commands:**\n`/setcookies` `/getcookies` `/cookiesstatus`" if is_admin(message.from_user.id) else ""
     await message.reply_text(
         "🎬 **Advanced YouTube Downloader**\n\n"
         "_WZML-X Style Quality Picker_\n\n"
@@ -580,6 +585,7 @@ async def start_cmd(client, message):
         "**Audio:** MP3 (64/128/192/320K)\n"
         "AAC • FLAC • M4A • OPUS • WAV\n\n"
         "/ping — Status  /help — Help"
+        + admin_hint
     )
 
 @app.on_message(filters.command("ping"))
@@ -587,17 +593,33 @@ async def ping_cmd(client, message):
     t = time.time()
     m = await message.reply_text("🏓 Pong!")
     ms = (time.time()-t)*1000
+    cookies_meta = await config.get_cookies_meta()
+    cookies_info = "❌ None"
+    if cookies_meta:
+        ts = cookies_meta.get("updated_at")
+        ts_str = ts.strftime("%d %b %Y %H:%M UTC") if ts else "?"
+        cookies_info = f"✅ {cookies_meta['size']:,} chars (updated {ts_str})"
     await m.edit_text(
         f"🏓 **Pong!** `{ms:.0f}ms`\n\n"
         f"⏱️ Uptime: `{time_fmt(time.time()-_BOT_START)}`\n"
-        f"🍪 Cookies: `{'✅' if COOKIES_FILE else '❌'}`\n"
+        f"🍪 Cookies: `{cookies_info}`\n"
         f"🔌 Proxy: `{'✅' if PROXY_URL else '❌'}`\n"
         f"🔄 Self-ping: `{'✅ ' + SELF_PING_URL if SELF_PING_URL else '❌ Set RENDER_EXTERNAL_URL'}`\n"
+        f"💾 MongoDB: `{'✅' if config.get_db() else '❌'}`\n"
         f"📂 Sessions: `{len(URL_SESSIONS)+len(PL_SESSIONS)}`"
     )
 
 @app.on_message(filters.command("help"))
 async def help_cmd(client, message):
+    admin_section = ""
+    if is_admin(message.from_user.id):
+        admin_section = (
+            "\n\n**Admin — Cookies Management:**\n"
+            "`/setcookies` — attach or reply-to a `cookies.txt` to update\n"
+            "`/getcookies` — download current cookies from DB\n"
+            "`/delcookies` — delete cookies from DB\n"
+            "`/cookiesstatus` — show cookies metadata & DB status"
+        )
     await message.reply_text(
         "**How to use:**\n"
         "1. Send a video or playlist URL\n"
@@ -613,12 +635,13 @@ async def help_cmd(client, message):
         "• AAC/FLAC/M4A/OPUS/WAV/VORBIS\n"
         "• Best Video / Best Audio\n"
         "• 2 minute timeout"
+        + admin_section
     )
 
 # ═══════════════════════════════════════════
 #    MESSAGE HANDLER
 # ═══════════════════════════════════════════
-@app.on_message(filters.text & ~filters.command(["start","ping","help"]))
+@app.on_message(filters.text & ~filters.command(["start","ping","help","setcookies","getcookies","delcookies","cookiesstatus"]))
 async def handle_url(client, message):
     uid  = message.from_user.id
     text = (message.text or "").strip()
@@ -636,10 +659,11 @@ async def handle_url(client, message):
             e["sel"] = indices
             WAITING_SEL.pop(uid, None)
             smsg = await message.reply_text(f"✅ Selected `{len(indices)}` videos. Fetching quality options...")
-            loop = asyncio.get_event_loop()
+            loop         = asyncio.get_event_loop()
+            cookies_path = await get_cookies_path()
             fu   = e["entries"][indices[0]].get("url") or e["entries"][indices[0]].get("webpage_url")
             try:
-                info = await loop.run_in_executor(None, _blocking_info, fu)
+                info = await loop.run_in_executor(None, _blocking_info, fu, cookies_path)
                 if not info: raise ValueError()
                 fmts, _ = parse_formats(info)
                 s_uid   = _new_uid()
@@ -661,10 +685,11 @@ async def handle_url(client, message):
     status = await message.reply_text("🔍 **Fetching info...**")
     loop   = asyncio.get_event_loop()
     _cleanup()
+    cookies_path = await get_cookies_path()          # ← fresh from DB
 
     if is_playlist_url(url):
         await _safe_edit(status, "📋 **Fetching playlist info...**")
-        info = await loop.run_in_executor(None, _blocking_playlist_info, url)
+        info = await loop.run_in_executor(None, _blocking_playlist_info, url, cookies_path)
         if info and info.get("_type") == "playlist":
             entries = [e for e in (info.get("entries") or []) if e][:MAX_PLAYLIST]
             if entries:
@@ -773,10 +798,11 @@ async def playlist_cb(client, query: CallbackQuery):
 
     if sub == "all":
         sm = await query.message.reply_text("🔍 Fetching quality options...")
-        loop = asyncio.get_event_loop()
+        loop         = asyncio.get_event_loop()
+        cookies_path = await get_cookies_path()
         fu = e["entries"][0].get("url") or e["entries"][0].get("webpage_url")
         try:
-            info = await loop.run_in_executor(None, _blocking_info, fu)
+            info = await loop.run_in_executor(None, _blocking_info, fu, cookies_path)
             if not info: raise ValueError()
             fmts2, _ = parse_formats(info)
             s_uid = _new_uid()
@@ -802,7 +828,6 @@ async def _start_dl(uid, qual, e, query, client):
     pl_uid     = e.get("pl_uid")
     pl_indices = e.get("pl_indices")
 
-    # Show title in the "starting" message
     title = (info.get("title","") or "")[:55]
     smsg = await query.message.reply_text(
         f"⚙️ **Starting download...**\n"
@@ -818,20 +843,24 @@ async def _start_dl(uid, qual, e, query, client):
         asyncio.create_task(_dl_single(url, qual, info, smsg, client, chat_id))
 
 async def _dl_single(url, qual, info, smsg, client, chat_id):
-    loop    = asyncio.get_event_loop()
-    uid     = _new_uid()
-    dl_dir  = os.path.join(DOWNLOADS_DIR, uid)
+    loop         = asyncio.get_event_loop()
+    cookies_path = await get_cookies_path()          # ← always fresh
+    uid          = _new_uid()
+    dl_dir       = os.path.join(DOWNLOADS_DIR, uid)
     os.makedirs(dl_dir, exist_ok=True)
     out_tmpl = os.path.join(dl_dir, "%(title,fulltitle,alt_title)s %(height)sp%(fps)s.fps %(tbr)d.%(ext)s")
 
     title = (info.get("title","") or "")[:55]
     await _safe_edit(smsg, f"🎬 `{title}`\n⬇️ **Downloading...**")
     result = await loop.run_in_executor(
-        None, _blocking_download, url, qual, out_tmpl, smsg, loop, title, False
+        None, _blocking_download, url, qual, out_tmpl, smsg, loop, title, False, cookies_path
     )
 
     if not result:
-        await _safe_edit(smsg, "❌ **Download failed!**\n\n• Try refreshing cookies.txt\n• Is this a private video?")
+        await _safe_edit(smsg,
+            "❌ **Download failed!**\n\n"
+            "• Try updating cookies: `/setcookies`\n"
+            "• Is this a private video?")
         with suppress(Exception): shutil.rmtree(dl_dir)
         return
 
@@ -843,7 +872,9 @@ async def _dl_single(url, qual, info, smsg, client, chat_id):
     with suppress(Exception): shutil.rmtree(dl_dir)
 
 async def _dl_playlist(entries, qual, base_info, smsg, client, chat_id, pl_uid):
-    loop = asyncio.get_event_loop(); total = len(entries); failed = []
+    loop         = asyncio.get_event_loop()
+    cookies_path = await get_cookies_path()          # ← fresh once per playlist run
+    total        = len(entries); failed = []
     for idx, en in enumerate(entries, 1):
         vid_id = en.get("id","")
         ie_key = en.get("ie_key","") or en.get("extractor","")
@@ -868,7 +899,7 @@ async def _dl_playlist(entries, qual, base_info, smsg, client, chat_id, pl_uid):
         out_tmpl = os.path.join(dl_dir, "%(title,fulltitle,alt_title)s %(height)sp%(fps)s.fps %(tbr)d.%(ext)s")
 
         result = await loop.run_in_executor(
-            None, _blocking_download, vurl, qual, out_tmpl, smsg, loop, vtitle, False
+            None, _blocking_download, vurl, qual, out_tmpl, smsg, loop, vtitle, False, cookies_path
         )
 
         if not result:
@@ -920,13 +951,17 @@ async def health_check(request):
 async def main():
     await app.start()
     logger.info("✅ Bot running with Pyrofork (Namespace: pyrogram)...")
-    
-    # Initialize MongoDB
-    await config.init_mongodb()
-    
-    # Setup admin handlers
-    await setup_admin_handlers(app)
 
+    # ── 1. MongoDB ──────────────────────────────────────────────────────────
+    await config.init_mongodb()
+
+    # ── 2. Cookies: auto-import local → DB, or restore DB → local ──────────
+    await auto_import_local_cookies(app)
+
+    # ── 3. Cookies admin handlers ───────────────────────────────────────────
+    await setup_cookies_handlers(app)
+
+    # ── 4. Web health-check ─────────────────────────────────────────────────
     web_app = web.Application()
     web_app.router.add_get("/", health_check)
     runner = web.AppRunner(web_app)
@@ -935,13 +970,11 @@ async def main():
     await site.start()
     logger.info(f"✅ Health check server running on port {PORT}")
 
-    # Start Render keep-alive background task
+    # ── 5. Render keep-alive ────────────────────────────────────────────────
     asyncio.create_task(keep_alive())
 
     await idle()
     await app.stop()
-    
-    # Close MongoDB connection
     await config.close_mongodb()
 
 if __name__ == "__main__":
