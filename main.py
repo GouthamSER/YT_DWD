@@ -142,7 +142,7 @@ async def keep_alive():
 # ═══════════════════════════════════════════
 #    PROGRESS TRACKER  (6-second refresh)
 # ═══════════════════════════════════════════
-PROGRESS_INTERVAL = 6
+PROGRESS_INTERVAL = 2  # Real-time refresh every 2 seconds
 
 class YtDlpProgress:
     def __init__(self, msg, loop, title="", prefix="", is_pl=False):
@@ -494,7 +494,22 @@ async def upload_file(client, chat_id, result, fmt, smsg):
     thumb = _find_thumb(os.path.dirname(fp))
     if sz > 2*1024**3:
         await _safe_edit(smsg, "❌ File size exceeds 2GB!"); return False
+
+    # Pre-check file readability to avoid mid-upload failures
+    try:
+        with open(fp, 'rb') as test_f:
+            test_f.read(1024)
+    except Exception as e:
+        logger.error(f"File pre-check failed: {e}")
+        await _safe_edit(smsg, f"❌ File read error: `{str(e)[:200]}`")
+        return False
+
     start = time.time()
+
+    # Reset progress tracking state on the message object
+    smsg._last_upload_update = 0
+    smsg._last_upload_pct = 0
+
     try:
         is_audio = fmt.startswith("ba/b") or fmt == "mp3"
         if is_audio:
@@ -502,7 +517,8 @@ async def upload_file(client, chat_id, result, fmt, smsg):
                 chat_id, fp, caption=cap, duration=dur,
                 title=filename[:64], performer=upl, thumb=thumb,
                 progress=progress_for_upload,
-                progress_args=(smsg, start, "Uploading Audio...", title),
+                progress_args=(smsg, start, "Uploading Audio", title),
+                disable_notification=True,  # Speed up by skipping notification
             )
         else:
             await client.send_video(
@@ -510,13 +526,27 @@ async def upload_file(client, chat_id, result, fmt, smsg):
                 width=info.get("width",1280), height=info.get("height",720),
                 thumb=thumb, supports_streaming=True,
                 progress=progress_for_upload,
-                progress_args=(smsg, start, "Uploading Video...", title),
+                progress_args=(smsg, start, "Uploading Video", title),
+                disable_notification=True,  # Speed up by skipping notification
             )
         return True
     except Exception as e:
         logger.error(f"Upload: {e}")
         await _safe_edit(smsg, f"❌ Upload failed: `{str(e)[:200]}`")
         return False
+
+
+# ═══════════════════════════════════════════
+#    CONCURRENT UPLOAD OPTIMIZATION
+# ═══════════════════════════════════════════
+_UPLOAD_SEMAPHORE = asyncio.Semaphore(2)  # Max 2 concurrent uploads
+
+async def upload_file_fast(client, chat_id, result, fmt, smsg, semaphore=None):
+    """Upload with optional concurrency control and optimized settings."""
+    if semaphore:
+        async with semaphore:
+            return await upload_file(client, chat_id, result, fmt, smsg)
+    return await upload_file(client, chat_id, result, fmt, smsg)
 
 # ═══════════════════════════════════════════
 #    QUALITY PICKER SHOW
